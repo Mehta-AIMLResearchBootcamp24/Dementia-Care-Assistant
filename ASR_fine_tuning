@@ -1,0 +1,222 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+!python -c "from huggingface_hub.hf_api import HfFolder; HfFolder.save_token('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')"
+!pip install huggingface_hub
+!pip install datasets
+!pip install evaluate
+!pip install jiwer
+
+from datasets import load_dataset, DatasetDict
+from transformers import WhisperProcessor
+from datasets import Audio
+import torch
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
+import evaluate
+from transformers.models.whisper.english_normalizer import BasicTextNormalizer
+from transformers import WhisperForConditionalGeneration
+from functools import partial
+from transformers import Seq2SeqTrainingArguments
+from transformers import Seq2SeqTrainer
+from tqdm.notebook import tqdm
+from transformers import WhisperForConditionalGeneration
+import pandas as pd
+from transformers.models.whisper.english_normalizer import BasicTextNormalizer
+
+medical_dataset = DatasetDict()
+
+medical_dataset["train"] = load_dataset(
+    "hthomas7/audio_dataset_8", split="train"
+)
+medical_dataset["val"] = load_dataset(
+    "hthomas7/audio_dataset_8", split="validation"
+)
+medical_dataset["test"] = load_dataset(
+    "hthomas7/audio_dataset_8", split="test"
+)
+
+print(medical_dataset)
+
+medical_dataset = medical_dataset.select_columns(["audio", "phrase"])
+
+processor = WhisperProcessor.from_pretrained(
+    "openai/whisper-small", language="english", task="transcribe"
+)
+
+sampling_rate = processor.feature_extractor.sampling_rate
+medical_dataset = medical_dataset.cast_column("audio", Audio(sampling_rate=sampling_rate))
+
+def prepare_dataset(example):
+    audio = example["audio"]
+
+    example = processor(
+        audio=audio["array"],
+        sampling_rate=audio["sampling_rate"],
+        text=example["phrase"],
+    )
+
+    # compute input length of audio sample in seconds
+    example["input_length"] = len(audio["array"]) / audio["sampling_rate"]
+
+    return example
+
+medical_dataset = medical_dataset.map(
+    prepare_dataset, remove_columns=medical_dataset.column_names["train"], num_proc=1
+)
+
+@dataclass
+class DataCollatorSpeechSeq2SeqWithPadding:
+    processor: Any
+
+    def __call__(
+        self, features: List[Dict[str, Union[List[int], torch.Tensor]]]
+    ) -> Dict[str, torch.Tensor]:
+        # split inputs and labels since they have to be of different lengths and need different padding methods
+        # first treat the audio inputs by simply returning torch tensors
+        input_features = [
+            {"input_features": feature["input_features"][0]} for feature in features
+        ]
+        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
+
+        # get the tokenized label sequences
+        label_features = [{"input_ids": feature["labels"]} for feature in features]
+        # pad the labels to max length
+        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
+
+        # replace padding with -100 to ignore loss correctly
+        labels = labels_batch["input_ids"].masked_fill(
+            labels_batch.attention_mask.ne(1), -100
+        )
+
+        # if bos token is appended in previous tokenization step,
+        # cut bos token here as it's append later anyways
+        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
+            labels = labels[:, 1:]
+
+        batch["labels"] = labels
+
+        return batch
+
+data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
+
+metric = evaluate.load("wer")
+
+normalizer = BasicTextNormalizer()
+
+
+def compute_metrics(pred):
+    pred_ids = pred.predictions
+    label_ids = pred.label_ids
+
+    # replace -100 with the pad_token_id
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+
+    # we do not want to group tokens when computing the metrics
+    pred_str = processor.batch_decode(pred_ids, skip_special_tokens=True)
+    label_str = processor.batch_decode(label_ids, skip_special_tokens=True)
+
+    # compute orthographic wer
+    wer_ortho = metric.compute(predictions=pred_str, references=label_str)
+
+    # compute normalised WER
+    pred_str_norm = [normalizer(pred) for pred in pred_str]
+    label_str_norm = [normalizer(label) for label in label_str]
+    # filtering step to only evaluate the samples that correspond to non-zero references:
+    pred_str_norm = [
+        pred_str_norm[i] for i in range(len(pred_str_norm)) if len(label_str_norm[i]) > 0
+    ]
+    label_str_norm = [
+        label_str_norm[i]
+        for i in range(len(label_str_norm))
+        if len(label_str_norm[i]) > 0
+    ]
+
+    wer = metric.compute(predictions=pred_str_norm, references=label_str_norm)
+
+    return {"wer_ortho": wer_ortho, "wer": wer}
+
+model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small")
+
+# disable cache during training since it's incompatible with gradient checkpointing
+model.config.use_cache = False
+
+!pip install accelerate==0.27.2
+
+training_args = Seq2SeqTrainingArguments(
+    output_dir="./whisper-small-fine-tuned-with-patient-conversations",  # name on the HF Hub
+    per_device_train_batch_size=16,
+    gradient_accumulation_steps=1,
+    learning_rate=1e-5,
+    lr_scheduler_type="constant_with_warmup",
+    warmup_steps=50,
+    max_steps=1000,
+    gradient_checkpointing=True,
+    fp16=True,
+    fp16_full_eval=True,
+    eval_strategy="steps",
+    per_device_eval_batch_size=16,
+    predict_with_generate=True,
+    generation_max_length=225,
+    save_steps=40,
+    eval_steps=40,
+    logging_steps=25,
+    report_to=["tensorboard"],
+    load_best_model_at_end=True,
+    metric_for_best_model="wer",
+    greater_is_better=False,
+    push_to_hub=True,
+)
+
+trainer = Seq2SeqTrainer(
+    args=training_args,
+    model=model,
+    train_dataset=medical_dataset["train"],
+    eval_dataset=medical_dataset["val"],
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+    tokenizer=processor,
+)
+
+trainer.train()
+
+trainer.push_to_hub()
+
+final_model = WhisperForConditionalGeneration.from_pretrained("ilyyyyy/whisper-small-fine-tuned-with-patient-conversations")
+
+transcription_list = []
+for i in tqdm(range(200)):
+  sample = medical_dataset['test'][i]["audio"]
+  #print("sample:", sample)
+  input_features = processor(sample["array"], sampling_rate=sample["sampling_rate"], return_tensors="pt").input_features
+  #print("input features:", input_features)
+  predicted_ids = final_model.generate(input_features) # generate token ids
+  #print("predicted ids:", predicted_ids)
+  transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)
+  if len(transcription) == 1:
+    transcription = transcription[0]
+  print(transcription)
+  transcription_list.append(transcription)
+
+df = pd.DataFrame({"PredLabels": transcription_list, "RefLabels": medical_dataset['test']['phrase']})
+df.head()
+df.to_csv("/content/drive/MyDrive/fine_tuned_audio_pred_and_ref.csv", index=False)
+
+pred_labels = transcription_list
+reference_labels = medical_dataset['test']['phrase']
+
+from transformers.models.whisper.english_normalizer import BasicTextNormalizer
+
+normalizer = BasicTextNormalizer()
+
+pred_str_norm = [normalizer(pred) for pred in pred_labels]
+label_str_norm = [normalizer(label) for label in reference_labels]
+
+metric = evaluate.load("wer")
+
+ortho_wer = metric.compute(predictions=pred_labels, references=reference_labels)
+
+norm_wer = metric.compute(predictions=pred_str_norm, references=label_str_norm)
+
+print(100*ortho_wer)
+print(100*norm_wer)
